@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# 检查aliyun和jq命令是否存在
+if ! command -v aliyun &> /dev/null || ! command -v jq &> /dev/null; then
+    echo "必要的命令行工具缺失。请确保已安装aliyun和jq。" >&2
+    exit 1
+fi
+
+
+declare -A instance_eip_map
+while IFS='=' read -r key value; do
+    if [[ "$key" =~ ^\[.*\]$ ]]; then
+        continue
+    fi
+    instance_eip_map["$key"]=$value
+done < /opt/instance-eip-map.conf
+
+for instance_id in "${!instance_eip_map[@]}"; do
+    eip_and_bandwidth_package_id=${instance_eip_map[$instance_id]}
+    IFS=":" read -ra eip_info <<< "$eip_and_bandwidth_package_id"
+    eip_id="${eip_info[0]}"
+    bandwidth_package_id="${eip_info[1]}"
+
+    describe_result=$(aliyun ecs DescribeInstanceStatus --region cn-hongkong --RegionId 'cn-hongkong' --InstanceId.1 "$instance_id" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "查询实例状态失败: $describe_result (实例ID: $instance_id)" >&2
+        continue
+    fi
+
+    instance_total=$(echo "$describe_result" | jq -r '.TotalCount' 2>/dev/null)
+    if [[ -z $instance_total || ! $instance_total =~ ^[0-9]+$ ]]; then
+        echo "该实例不存在 (实例ID: $instance_id)" >&2
+        continue
+    fi
+
+    if ((instance_total == 0)); then
+        eip_exist_result=$(aliyun vpc DescribeEipAddresses --region cn-hongkong --RegionId 'cn-hongkong' --AllocationId "$eip_id" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "查询EIP状态失败: $eip_exist_result (EIP ID: $eip_id)" >&2
+            continue
+        fi
+
+        total_count=$(echo "$eip_exist_result" | jq -r '.TotalCount')
+
+        if [[ "$total_count" == "0" ]]; then
+            echo "EIP $eip_id 已释放或不存在"
+            exit 0
+        fi
+
+        remove_result=$(aliyun vpc RemoveCommonBandwidthPackageIp \
+            --region cn-hongkong \
+            --RegionId 'cn-hongkong' \
+            --BandwidthPackageId "$bandwidth_package_id" \
+            --IpInstanceId "$eip_id" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "EIP与共享带宽包未关联: (EIP ID: $eip_id, 共享带宽包ID: $bandwidth_package_id)" >&2
+        else
+            echo "成功移除EIP $eip_id 与共享带宽包 $bandwidth_package_id 的关联"
+        fi
+
+        release_result=$(aliyun vpc ReleaseEipAddress --region cn-hongkong --RegionId 'cn-hongkong' --AllocationId "$eip_id" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "释放EIP失败: $release_result (EIP ID: $eip_id)" >&2
+        else
+            echo "成功释放EIP $eip_id (实例ID: $instance_id)"
+            exit 0
+        fi
+    else
+        echo "实例存在，无需释放EIP (实例ID: $instance_id)"
+    fi
+done
+
+exit 0
